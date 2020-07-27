@@ -1,0 +1,223 @@
+# Node.js
+# Build a general Node.js project with npm.
+# Add steps that analyze code, save build artifacts, deploy, and more:
+# https://docs.microsoft.com/azure/devops/pipelines/languages/javascript
+
+trigger:
+- master
+- development
+pr:
+- master
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+- stage: Pre_Build
+  jobs:
+  - job: Install_Nodejs
+    steps:
+    - task: NodeTool@0
+      inputs:
+        versionSpec: '12.x'
+      displayName: 'Install Node.js'
+  - job: Install_SAM_CLI
+    dependsOn: Install_Nodejs
+    steps:
+    - script: |
+        sh -c "$(curl -fsSL https://raw.githubusercontent.com/Linuxbrew/install/master/install.sh)"
+        test -d ~/.linuxbrew && eval $(~/.linuxbrew/bin/brew shellenv)
+        test -d /home/linuxbrew/.linuxbrew && eval $(/home/linuxbrew/.linuxbrew/bin/brew shellenv)
+        test -r ~/.bash_profile && echo "eval \$($(brew --prefix)/bin/brew shellenv)" >>~/.bash_profile
+        echo "eval \$($(brew --prefix)/bin/brew shellenv)" >>~/.profile
+        brew tap aws/tap
+        brew install aws-sam-cli
+      displayName: 'sam install'
+
+- stage: Build
+  dependsOn: Pre_Build
+  condition: succeeded('Pre_Build')
+  jobs:
+  - job: Upload_sam_package
+    steps:
+    - script: |
+        cd sam/lambda-layer/nodejs
+        npm init --yes
+        npm install winston
+        npm install jsonschema
+      displayName: 'npm install'
+    - task: AWSShellScript@1
+      inputs:
+        awsCredentials: 'AWS-eiti-demoaccount'
+        regionName: 'ap-southeast-2'
+        scriptType: 'inline'
+        inlineScript: 'sam package --template-file sam-template.yaml --output-template-file sam-deploy.yaml --s3-bucket aws-sam-code-eiti'
+        disableAutoCwd: true
+        workingDirectory: 'sam/'
+      displayName: 'Upload SAM package to s3'
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: 'sam/sam-deploy.yaml'
+        artifact: 'sam-deploy-template-$(Build.SourceBranchName)'
+        publishLocation: 'pipeline'
+      displayName: 'Upload SAM package to pipeline'
+    
+
+- stage: Deploy_to_Dev
+  dependsOn: Data_load
+  condition: and(succeeded(), ne(variables['Build.SourceBranch'], 'refs/heads/master'))
+  jobs:
+  - deployment: terraform_tasks
+    displayName: Terraform Deploy tasks
+    pool:                 # see pool schema
+      vmImage: 'ubuntu-18.04'
+    # container: hashicorp/terraform:0.12.24 #ubuntu:16.04 # container to run this job inside
+    # demands:
+    # - SpecialSoftware # Check if SpecialSoftware capability exists
+    # - Agent.OS -equals Linux # Check if Agent.OS == Linux
+    continueOnError: false                # 'true' if future jobs should run even if this job fails; defaults to 'false'
+    # services: { string: string | container } # container resources to run as a service container
+    timeoutInMinutes: 10        # how long to run the job before automatically cancelling
+    cancelTimeoutInMinutes: 10  # how much time to give 'run always even if cancelled tasks' before killing them
+    variables: { stage: v1 } 
+    environment: development  # target environment name and optionally a resource-name to record the deployment history; format: <environment-name>.<resource-name>
+    # strategy: [ deployment strategy ] # see deployment strategy schema
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              buildType: 'current'
+              artifactName: 'sam-deploy-template-$(Build.SourceBranchName)'
+              targetPath: '$(Build.SourcesDirectory)/sam'
+          - task: TerraformInstaller@0
+            inputs:
+              terraformVersion: '0.12.28'
+            displayName: 'Setup terraform cli'
+          - task: AWSShellScript@1
+            inputs:
+              awsCredentials: 'AWS-eiti-demoaccount'
+              regionName: 'ap-southeast-2'
+              scriptType: 'inline'
+              inlineScript: 'cd terraform; terraform init;'
+              workingDirectory: 'terraform/'
+            displayName: 'terraform init'
+          - task: AWSShellScript@1
+            continueOnError: true
+            inputs:
+              awsCredentials: 'AWS-eiti-demoaccount'
+              regionName: 'ap-southeast-2'
+              scriptType: 'inline'
+              inlineScript: 'cd terraform; terraform workspace new dev || terraform workspace select dev;'
+              workingDirectory: 'terraform/'
+            displayName: 'terraform workspace dev'
+          - task: AWSShellScript@1
+            inputs:
+              awsCredentials: 'AWS-eiti-demoaccount'
+              regionName: 'ap-southeast-2'
+              scriptType: 'inline'
+              inlineScript: 'cd terraform; terraform plan -var="stage_name=dev" -no-color'
+              workingDirectory: 'terraform/'
+            displayName: 'terraform plan'
+          - task: AWSShellScript@1
+            inputs:
+              awsCredentials: 'AWS-eiti-demoaccount'
+              regionName: 'ap-southeast-2'
+              scriptType: 'inline'
+              inlineScript: 'cd terraform; terraform apply -var="stage_name=dev" -auto-approve'
+              workingDirectory: 'terraform/'
+            displayName: 'terraform apply'
+
+- stage: Deploy_to_Production
+  dependsOn: Data_load
+  condition: and(succeeded('Build'), eq(variables['Build.SourceBranch'], 'refs/heads/master'))
+  jobs:
+  - deployment: terraform_tasks
+    displayName: Terraform Deploy tasks
+    pool:                 # see pool schema
+      vmImage: 'ubuntu-18.04'
+    # container: hashicorp/terraform:0.12.24 #ubuntu:16.04 # container to run this job inside
+    # demands:
+    # - SpecialSoftware # Check if SpecialSoftware capability exists
+    # - Agent.OS -equals Linux # Check if Agent.OS == Linux
+    continueOnError: false                # 'true' if future jobs should run even if this job fails; defaults to 'false'
+    # services: { string: string | container } # container resources to run as a service container
+    timeoutInMinutes: 10        # how long to run the job before automatically cancelling
+    cancelTimeoutInMinutes: 10  # how much time to give 'run always even if cancelled tasks' before killing them
+    variables: { stage: v1 } 
+    environment: production  # target environment name and optionally a resource-name to record the deployment history; format: <environment-name>.<resource-name>
+    # strategy: [ deployment strategy ] # see deployment strategy schema
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              buildType: 'current'
+              artifactName: 'sam-deploy-template-$(Build.SourceBranchName)'
+              targetPath: '$(Build.SourcesDirectory)/sam'
+          - task: TerraformInstaller@0
+            inputs:
+              terraformVersion: '0.12.28'
+            displayName: 'Setup terraform cli'
+          - task: AWSShellScript@1
+            inputs:
+              awsCredentials: 'AWS-eiti-demoaccount'
+              regionName: 'ap-southeast-2'
+              scriptType: 'inline'
+              inlineScript: 'pwd; ls -al; cd terraform; terraform init'
+              workingDirectory: 'terraform/'
+            displayName: 'terraform init'
+          - task: AWSShellScript@1
+            continueOnError: true
+            inputs:
+              awsCredentials: 'AWS-eiti-demoaccount'
+              regionName: 'ap-southeast-2'
+              scriptType: 'inline'
+              inlineScript: 'cd terraform; terraform workspace new prod || terraform workspace select prod;'
+              workingDirectory: 'terraform/'
+            displayName: 'terraform workspace new'
+          - task: AWSShellScript@1
+            inputs:
+              awsCredentials: 'AWS-eiti-demoaccount'
+              regionName: 'ap-southeast-2'
+              scriptType: 'inline'
+              inlineScript: 'cd terraform; terraform plan -var="stage_name=prod" -no-color'
+              workingDirectory: 'terraform/'
+            displayName: 'terraform plan'
+          - task: AWSShellScript@1
+            inputs:
+              awsCredentials: 'AWS-eiti-demoaccount'
+              regionName: 'ap-southeast-2'
+              scriptType: 'inline'
+              inlineScript: 'cd terraform; terraform apply -var="stage_name=prod" -auto-approve'
+              workingDirectory: 'terraform/'
+            displayName: 'terraform apply'
+
+- stage: Data_load
+  dependsOn: Build
+  condition: succeeded('Build')
+  jobs:  
+  - job: load_sample_dynamodb_data
+    variables:
+    - name: EMPLOYEES_DDB_TABLE
+      value: employees-api-table 
+    steps:
+    - script: |
+        cd scripts
+        npm init --yes
+        npm install ora
+        npm install aws-sdk
+      displayName: 'npm install'
+    - task: AWSShellScript@1
+      inputs:
+        awsCredentials: 'AWS-eiti-demoaccount'
+        regionName: 'ap-southeast-2'
+        scriptType: 'inline'
+        inlineScript: 'export EMPLOYEES_DDB_TABLE="employees-api-prod-table"; node import-employees.js'
+        disableAutoCwd: true
+        workingDirectory: 'scripts/'
+      displayName: 'Load sample data on DynamoDB'
