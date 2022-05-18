@@ -8,7 +8,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "jsonschema": "^1.2.6",
+    "jsonschema": "^1.4.0",
     "winston": "^3.3.3"
   },
   "devDependencies": {},
